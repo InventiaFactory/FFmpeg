@@ -3698,14 +3698,15 @@ static int process_input(int file_index)
 
     if (debug_ts) {
         av_log(NULL, AV_LOG_INFO, "demuxer -> ist_index:%d type:%s "
-               "next_dts:%s next_dts_time:%s next_pts:%s next_pts_time:%s pkt_pts:%s pkt_pts_time:%s pkt_dts:%s pkt_dts_time:%s off:%s off_time:%s\n",
+               "next_dts:%s next_dts_time:%s next_pts:%s next_pts_time:%s pkt_pts:%s pkt_pts_time:%s pkt_dts:%s pkt_dts_time:%s off:%s off_time:%s duration: %d\n",
                ifile->ist_index + pkt.stream_index, av_get_media_type_string(ist->dec_ctx->codec_type),
                av_ts2str(ist->next_dts), av_ts2timestr(ist->next_dts, &AV_TIME_BASE_Q),
                av_ts2str(ist->next_pts), av_ts2timestr(ist->next_pts, &AV_TIME_BASE_Q),
                av_ts2str(pkt.pts), av_ts2timestr(pkt.pts, &ist->st->time_base),
                av_ts2str(pkt.dts), av_ts2timestr(pkt.dts, &ist->st->time_base),
                av_ts2str(input_files[ist->file_index]->ts_offset),
-               av_ts2timestr(input_files[ist->file_index]->ts_offset, &AV_TIME_BASE_Q));
+               av_ts2timestr(input_files[ist->file_index]->ts_offset, &AV_TIME_BASE_Q),
+			   pkt.duration);
     }
 
     if(!ist->wrap_correction_done && is->start_time != AV_NOPTS_VALUE && ist->st->pts_wrap_bits < 64){
@@ -3764,6 +3765,7 @@ static int process_input(int file_index)
         }
     }
 
+	//av_log(NULL, AV_LOG_INFO, "pkt.pts %ld += av_rescale_q(ifile->ts_offset, AV_TIME_BASE_Q, ist->st->time_base) ifile->ts_offset %ld ist->ts_scale %d\n", pkt.pts, ifile->ts_offset, ist->ts_scale);
     if (pkt.dts != AV_NOPTS_VALUE)
         pkt.dts += av_rescale_q(ifile->ts_offset, AV_TIME_BASE_Q, ist->st->time_base);
     if (pkt.pts != AV_NOPTS_VALUE)
@@ -3773,7 +3775,7 @@ static int process_input(int file_index)
         pkt.pts *= ist->ts_scale;
     if (pkt.dts != AV_NOPTS_VALUE)
         pkt.dts *= ist->ts_scale;
-
+		
     if ((ist->dec_ctx->codec_type == AVMEDIA_TYPE_VIDEO ||
          ist->dec_ctx->codec_type == AVMEDIA_TYPE_AUDIO) &&
         pkt.dts != AV_NOPTS_VALUE && ist->next_dts == AV_NOPTS_VALUE && !copy_ts
@@ -3787,6 +3789,7 @@ static int process_input(int file_index)
                    "Inter stream timestamp discontinuity %"PRId64", new offset= %"PRId64"\n",
                    delta, ifile->ts_offset);
             pkt.dts -= av_rescale_q(delta, AV_TIME_BASE_Q, ist->st->time_base);
+			av_log(NULL, AV_LOG_INFO, "pkt.pts %ld += pkt.pts -= av_rescale_q(delta, AV_TIME_BASE_Q, ist->st->time_base) delta %ld\n", pkt.pts, delta);
             if (pkt.pts != AV_NOPTS_VALUE)
                 pkt.pts -= av_rescale_q(delta, AV_TIME_BASE_Q, ist->st->time_base);
         }
@@ -3807,6 +3810,7 @@ static int process_input(int file_index)
                        "timestamp discontinuity %"PRId64", new offset= %"PRId64"\n",
                        delta, ifile->ts_offset);
                 pkt.dts -= av_rescale_q(delta, AV_TIME_BASE_Q, ist->st->time_base);
+				av_log(NULL, AV_LOG_INFO, "2 pkt.pts %ld += pkt.pts -= av_rescale_q(delta, AV_TIME_BASE_Q, ist->st->time_base) delta %ld\n", pkt.pts, delta);
                 if (pkt.pts != AV_NOPTS_VALUE)
                     pkt.pts -= av_rescale_q(delta, AV_TIME_BASE_Q, ist->st->time_base);
             }

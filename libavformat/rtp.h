@@ -110,6 +110,7 @@ enum RTCPType {
 #define RTP_PT_IS_RTCP(x) (((x) >= RTCP_FIR && (x) <= RTCP_IJ) || \
                            ((x) >= RTCP_SR  && (x) <= RTCP_TOKEN))
 
-#define NTP_TO_RTP_FORMAT(x) av_rescale((x), INT64_C(1) << 32, 1000000)
+//#define NTP_TO_RTP_FORMAT(x) av_rescale((x), INT64_C(1) << 32, 1000000)
+#define NTP_TO_RTP_FORMAT(ntp_time) (ntp_time / 1000000LL) << 32 | (((ntp_time - (ntp_time / 1000000LL) * 1000000LL) * 65536LL / 1000000LL) << 16)
 
 #endif /* AVFORMAT_RTP_H */

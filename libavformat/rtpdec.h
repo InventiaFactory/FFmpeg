@@ -47,7 +47,7 @@ void ff_rtp_parse_set_dynamic_protocol(RTPDemuxContext *s, PayloadContext *ctx,
 void ff_rtp_parse_set_crypto(RTPDemuxContext *s, const char *suite,
                              const char *params);
 int ff_rtp_parse_packet(RTPDemuxContext *s, AVPacket *pkt,
-                        uint8_t **buf, int len);
+	uint8_t **buf, int len, int wasBuffered);
 void ff_rtp_parse_close(RTPDemuxContext *s);
 int64_t ff_rtp_queued_packet_time(RTPDemuxContext *s);
 void ff_rtp_reset_packet_queue(RTPDemuxContext *s);
@@ -146,6 +146,12 @@ typedef struct RTPPacket {
     struct RTPPacket *next;
 } RTPPacket;
 
+typedef struct RTPBuffer {
+	uint8_t *buf;
+	int len;
+	struct RTPBuffer *next;
+} RTPBuffer;
+
 struct RTPDemuxContext {
     AVFormatContext *ic;
     AVStream *st;
@@ -172,6 +178,7 @@ struct RTPDemuxContext {
     RTPPacket* queue; ///< A sorted queue of buffered packets not yet returned
     int queue_len;    ///< The number of packets in queue
     int queue_size;   ///< The size of queue, or 0 if reordering is disabled
+	RTPBuffer* waiting_buffers_queue; ///< A sorted queue of buffered packets not yet returned
     /*@}*/
 
     /* rtcp sender statistics receive */
@@ -181,6 +188,7 @@ struct RTPDemuxContext {
     uint32_t last_rtcp_timestamp;
     int64_t rtcp_ts_offset;
 
+	uint64_t last_decoded_time_us;
     /* rtcp sender statistics */
     unsigned int packet_count;
     unsigned int octet_count;

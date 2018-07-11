@@ -53,9 +53,18 @@
 #define DURATION_FIRST    2
 
 
+#define MAX_CACHE_SECONDS 20 
+
+#define CONSUME_CACHE_MILLISECONDS 500LL
+#define MIN_CACHE_MILLISECONDS CONSUME_CACHE_MILLISECONDS * 2
+
+
 typedef struct FrameInfo {
     int nb_samples;
     int64_t pts;
+	int64_t length_pts;
+	int64_t offset;
+    AVFrame *frame;
     struct FrameInfo *next;
 } FrameInfo;
 
@@ -68,8 +77,6 @@ typedef struct FrameInfo {
  * requested by the output link.
  */
 typedef struct FrameList {
-    int nb_frames;
-    int nb_samples;
     FrameInfo *list;
     FrameInfo *end;
 } FrameList;
@@ -80,77 +87,34 @@ static void frame_list_clear(FrameList *frame_list)
         while (frame_list->list) {
             FrameInfo *info = frame_list->list;
             frame_list->list = info->next;
+            if(info->frame) {
+            	av_frame_free(&info->frame);
+			}
             av_free(info);
         }
-        frame_list->nb_frames  = 0;
-        frame_list->nb_samples = 0;
         frame_list->end        = NULL;
     }
 }
 
-static int frame_list_next_frame_size(FrameList *frame_list)
-{
-    if (!frame_list->list)
-        return 0;
-    return frame_list->list->nb_samples;
-}
 
 static int64_t frame_list_next_pts(FrameList *frame_list)
 {
-    if (!frame_list->list)
+    if (!frame_list->list || frame_list->list->pts == AV_NOPTS_VALUE)
         return AV_NOPTS_VALUE;
-    return frame_list->list->pts;
+	
+    return frame_list->list->pts + frame_list->list->offset;
 }
 
-static void frame_list_remove_samples(FrameList *frame_list, int nb_samples)
+static int64_t frame_list_last_pts(FrameList *frame_list)
 {
-    if (nb_samples >= frame_list->nb_samples) {
-        frame_list_clear(frame_list);
-    } else {
-        int samples = nb_samples;
-        while (samples > 0) {
-            FrameInfo *info = frame_list->list;
-            av_assert0(info);
-            if (info->nb_samples <= samples) {
-                samples -= info->nb_samples;
-                frame_list->list = info->next;
-                if (!frame_list->list)
-                    frame_list->end = NULL;
-                frame_list->nb_frames--;
-                frame_list->nb_samples -= info->nb_samples;
-                av_free(info);
-            } else {
-                info->nb_samples       -= samples;
-                info->pts              += samples;
-                frame_list->nb_samples -= samples;
-                samples = 0;
-            }
-        }
-    }
+    if (!frame_list->list || !frame_list->end)
+        return AV_NOPTS_VALUE;
+
+	return frame_list->end->pts + frame_list->end->length_pts;
 }
 
-static int frame_list_add_frame(FrameList *frame_list, int nb_samples, int64_t pts)
-{
-    FrameInfo *info = av_malloc(sizeof(*info));
-    if (!info)
-        return AVERROR(ENOMEM);
-    info->nb_samples = nb_samples;
-    info->pts        = pts;
-    info->next       = NULL;
 
-    if (!frame_list->list) {
-        frame_list->list = info;
-        frame_list->end  = info;
-    } else {
-        av_assert0(frame_list->end);
-        frame_list->end->next = info;
-        frame_list->end       = info;
-    }
-    frame_list->nb_frames++;
-    frame_list->nb_samples += nb_samples;
 
-    return 0;
-}
 
 
 typedef struct MixContext {
@@ -165,12 +129,12 @@ typedef struct MixContext {
     int nb_channels;            /**< number of channels */
     int sample_rate;            /**< sample rate */
     int planar;
-    AVAudioFifo **fifos;        /**< audio fifo for each input */
     uint8_t *input_state;       /**< current state of each input */
     float *input_scale;         /**< mixing scale factor for each input */
     float scale_norm;           /**< normalization factor for all inputs */
-    int64_t next_pts;           /**< calculated pts for next output frame */
-    FrameList *frame_list;      /**< list of frame info for the first input */
+    FrameList **inputs_frame_list;      /**< list of frame info for the first input */
+	int64_t last_output_pts; //last generated pts
+	int64_t max_cache_pts;
 } MixContext;
 
 #define OFFSET(x) offsetof(MixContext, x)
@@ -192,6 +156,198 @@ static const AVOption amix_options[] = {
 
 AVFILTER_DEFINE_CLASS(amix);
 
+static int frame_list_add_frame(FrameList *frame_list, AVFrame *frame, int64_t pts, MixContext *s, AVFilterLink *outlink, int stream_idx)
+{
+	FrameInfo *info, **next_frame, *prev_frame = NULL;
+	int64_t frame_length_pts = av_rescale_q(frame->nb_samples, (AVRational){ 1, outlink->sample_rate }, outlink->time_base);
+	int64_t frame_end_pts = pts + frame_length_pts;
+	
+
+	if (frame_list->list && (frame_end_pts - (frame_list->list->pts + frame_list->list->offset) > s->max_cache_pts)) {
+		av_log(NULL, AV_LOG_ERROR,
+			"amix frame_list_add_frame stream %d reached cache buffer limit (cache start pts: %ld, last frame end pts: %ld, limit in pts: %ld, limit in seconds: %d)!\n",
+			stream_idx,
+			frame_list->list->pts + frame_list->list->offset,
+			frame_end_pts,
+			s->max_cache_pts,
+			MAX_CACHE_SECONDS
+			);
+		return AVERROR(ENOMEM);
+	}
+
+	//find the previous (related to this one) frame considenring that in udp some frames can arrive later than expected
+	next_frame = &(frame_list->list);
+	while (*next_frame) {
+		if ((pts < (*next_frame)->pts))  {
+			break;
+		}
+		prev_frame = *next_frame;
+		next_frame = &((*next_frame)->next);
+	}
+
+
+	//does the prev_frame ends after the end of this frame  (total overlap)?
+	//queue: |----| |----|
+	//prev     ^
+	//next             ^
+	//frame    |--|      
+	if (prev_frame && ((prev_frame)->pts + (prev_frame)->length_pts >= pts + frame_length_pts)) {
+		//discard the whole frame!
+		av_log(NULL, AV_LOG_WARNING,
+			"amix frame_list_add_frame stream %d discarding whole frame beacuse end pts %ld is less than prev frame end pts %ld!\n",
+			stream_idx,
+			pts + frame_length_pts,
+			(prev_frame)->pts + (prev_frame)->length_pts
+			);
+		return 0;
+	}
+
+
+	//does the next_frame ends before the end of this frame  (total overlap)?
+	//queue: |----|      |----|
+	//prev     ^
+	//next                  ^
+	//frame           |---------|   
+	if ((*next_frame) && ((*next_frame)->pts + (*next_frame)->length_pts <= pts + frame_length_pts)) {
+		//discard the whole frame!
+		av_log(NULL, AV_LOG_WARNING,
+			"amix frame_list_add_frame stream %d discarding whole frame beacuse end pts %ld is greater than next frame end pts %ld!\n",
+			stream_idx,
+			pts + frame_length_pts,
+			(*next_frame)->pts + (*next_frame)->length_pts
+			);
+		return 0;
+	}
+
+	info = av_malloc(sizeof(*info));
+	if (!info) {
+		av_log(NULL, AV_LOG_ERROR, "amix frame_list_add_frame CANNOT ALLOCATE FRAME_INFO !!!!\n");
+		return AVERROR(ENOMEM);
+	}
+	info->nb_samples = frame->nb_samples;
+	info->length_pts = frame_length_pts;
+	info->pts = pts;
+	info->next = NULL;
+	
+	if (*next_frame != NULL) {
+		av_log(NULL, AV_LOG_INFO, "amix frame_list_add_frame stream %d adding frame in the middle (this pts: %ld, this pts_end: %ld, next pts: %ld) ...\n", stream_idx, pts, pts + frame_length_pts, (*next_frame)->pts);
+		//there is a frame next to this one eg:
+		//queue:   |-----|      |------|
+		//info:         |-----|
+		//next_frame            ^
+		info->next = *next_frame;
+		//her we are updating the next field of the preceding frame or the head of the list
+		(*next_frame) = info;
+	}
+	else {
+		//there is no frame next to this one eg:
+		//queue:    |-----|  |------|
+		//info:                         |----|
+		//next_frame  NULL
+		//or 
+		//queue: NULL
+		//info:  |----|
+		//next_frame  NULL
+
+		*next_frame = info;
+		frame_list->end = info;
+	}
+	info->offset = 0;
+	info->frame = av_frame_clone(frame);
+
+	if (!info->frame) {
+		av_log(NULL, AV_LOG_ERROR, "amix frame_list_add_frame CANNOT ALLOCATE INFO->FRAME !!!!\n");
+		return AVERROR(ENOMEM);
+	}
+
+
+	av_assert0(frame_list->end);
+
+	if (prev_frame != NULL && prev_frame->pts + prev_frame->length_pts > info->pts) {
+		//av_log(NULL, AV_LOG_INFO, "START1PREV amix frame_list_add_frame pts: %ld ...\n", pts);
+		//if previous frame overlaps the start of this frame
+		//prev_frame |----------|
+		//info             |------|
+		//offset            XXX
+		info->offset = prev_frame->pts + prev_frame->length_pts - info->pts;
+
+		if (info->offset >= info->length_pts) {
+			//prev_frame |--------------|
+			//info             |-----|
+			//offset           XXXXXXXXXX
+			av_log(NULL, AV_LOG_ERROR,
+				"amix frame_list_add_frame stream %d UNEXPECTED FRAME TOTAL OVERLAPPING (%ld samples of %ld) beacuse start pts %ld is less than prev_frame end pts %ld (prev_frame start is %ld, length is %ld)!\n",
+				stream_idx,
+				info->offset,
+				frame_length_pts,
+				pts,
+				(prev_frame->pts + prev_frame->length_pts),
+				prev_frame->pts,
+				prev_frame->length_pts
+				);
+
+			//normalize offset to be not greater than frame length
+			info->offset = info->length_pts;
+		} else if (info->offset > 2) {
+			av_log(NULL, AV_LOG_WARNING,
+				"amix frame_list_add_frame stream %d discarding partial of this frame (%ld samples of %ld) beacuse start pts %ld is less than prev_frame end pts %ld (prev_frame start is %ld, length is %ld)!\n",
+				stream_idx,
+				info->offset,
+				frame_length_pts,
+				pts,
+				(prev_frame->pts + prev_frame->length_pts),
+				prev_frame->pts,
+				prev_frame->length_pts
+				);
+		}
+
+	}
+
+	if (info->next && info->next->pts < info->pts + info->length_pts) {
+		//if next frame overlaps the end of this frame
+		//next_frame       |-----|
+		//info         |------|
+		//nextoffset        XXX
+		info->next->offset = info->pts + info->length_pts - info->next->pts;
+		
+		if (info->next->offset >= info->next->length_pts) {
+			//next_frame       |-----|
+			//info           |---------|
+			//nextoffset        XXXXXXXX
+			av_log(NULL, AV_LOG_ERROR,
+				"amix frame_list_add_frame stream %d UNEXPECTED FRAME TOTAL OVERLAPPING (%ld samples of %ld) beacuse next_frame start pts %ld is less than this frame end pts %ld (this frame start is %ld, length is %ld)!\n",
+				stream_idx,
+				info->next->offset,
+				info->next->length_pts,
+				info->next->pts,
+				(info->pts + info->length_pts),
+				info->pts,
+				info->length_pts
+				);
+			//normalize offset to be not greater than frame length
+			info->next->offset = info->next->length_pts;
+		} else if (info->next->offset > 2) {
+			av_log(NULL, AV_LOG_WARNING,
+				"amix frame_list_add_frame stream %d discarding partial of next frame (%ld samples of %ld) beacuse next_frame start pts %ld is less than this frame end pts %ld (this frame start is %ld, length is %ld)!\n",
+				stream_idx,
+				info->next->offset,
+				info->next->length_pts,
+				info->next->pts,
+				(info->pts + info->length_pts),
+				info->pts,
+				info->length_pts
+				);
+		}
+	}
+	else if (info->next) {
+		info->next->offset = 0;
+	}
+
+	return 0;
+}
+
+
+
 /**
  * Update the scaling factors to apply to each input during mixing.
  *
@@ -199,14 +355,11 @@ AVFILTER_DEFINE_CLASS(amix);
  * volume transitions when EOF is encountered on an input but mixing continues
  * with the remaining inputs.
  */
-static void calculate_scales(MixContext *s, int nb_samples)
+static void calculate_scales(MixContext *s)
 {
     int i;
 
-    if (s->scale_norm > s->active_inputs) {
-        s->scale_norm -= nb_samples / (s->dropout_transition * s->sample_rate);
-        s->scale_norm = FFMAX(s->scale_norm, s->active_inputs);
-    }
+    s->scale_norm = s->active_inputs;
 
     for (i = 0; i < s->nb_inputs; i++) {
         if (s->input_state[i] == INPUT_ON)
@@ -223,23 +376,22 @@ static int config_output(AVFilterLink *outlink)
     int i;
     char buf[64];
 
+	s->last_output_pts = AV_NOPTS_VALUE;
     s->planar          = av_sample_fmt_is_planar(outlink->format);
     s->sample_rate     = outlink->sample_rate;
     outlink->time_base = (AVRational){ 1, outlink->sample_rate };
-    s->next_pts        = AV_NOPTS_VALUE;
+	outlink->flags |= FF_LINK_FLAG_REQUEST_LOOP;
+	s->max_cache_pts = MAX_CACHE_SECONDS * outlink->sample_rate;
 
-    s->frame_list = av_mallocz(sizeof(*s->frame_list));
-    if (!s->frame_list)
+    s->inputs_frame_list = av_mallocz_array(s->nb_inputs, sizeof(*s->inputs_frame_list));
+    if (!s->inputs_frame_list)
         return AVERROR(ENOMEM);
 
-    s->fifos = av_mallocz_array(s->nb_inputs, sizeof(*s->fifos));
-    if (!s->fifos)
-        return AVERROR(ENOMEM);
 
     s->nb_channels = av_get_channel_layout_nb_channels(outlink->channel_layout);
     for (i = 0; i < s->nb_inputs; i++) {
-        s->fifos[i] = av_audio_fifo_alloc(outlink->format, s->nb_channels, 1024);
-        if (!s->fifos[i])
+        s->inputs_frame_list[i] =av_mallocz(sizeof(*s->inputs_frame_list[i]));
+		if (!s->inputs_frame_list[i])
             return AVERROR(ENOMEM);
     }
 
@@ -253,7 +405,7 @@ static int config_output(AVFilterLink *outlink)
     if (!s->input_scale)
         return AVERROR(ENOMEM);
     s->scale_norm = s->active_inputs;
-    calculate_scales(s, 0);
+    calculate_scales(s);
 
     av_get_channel_layout_string(buf, sizeof(buf), -1, outlink->channel_layout);
 
@@ -264,104 +416,7 @@ static int config_output(AVFilterLink *outlink)
     return 0;
 }
 
-/**
- * Read samples from the input FIFOs, mix, and write to the output link.
- */
-static int output_frame(AVFilterLink *outlink, int nb_samples)
-{
-    AVFilterContext *ctx = outlink->src;
-    MixContext      *s = ctx->priv;
-    AVFrame *out_buf, *in_buf;
-    int i;
 
-    calculate_scales(s, nb_samples);
-
-    out_buf = ff_get_audio_buffer(outlink, nb_samples);
-    if (!out_buf)
-        return AVERROR(ENOMEM);
-
-    in_buf = ff_get_audio_buffer(outlink, nb_samples);
-    if (!in_buf) {
-        av_frame_free(&out_buf);
-        return AVERROR(ENOMEM);
-    }
-
-    for (i = 0; i < s->nb_inputs; i++) {
-        if (s->input_state[i] == INPUT_ON) {
-            int planes, plane_size, p;
-
-            av_audio_fifo_read(s->fifos[i], (void **)in_buf->extended_data,
-                               nb_samples);
-
-            planes     = s->planar ? s->nb_channels : 1;
-            plane_size = nb_samples * (s->planar ? 1 : s->nb_channels);
-            plane_size = FFALIGN(plane_size, 16);
-
-            for (p = 0; p < planes; p++) {
-                s->fdsp->vector_fmac_scalar((float *)out_buf->extended_data[p],
-                                           (float *) in_buf->extended_data[p],
-                                           s->input_scale[i], plane_size);
-            }
-        }
-    }
-    av_frame_free(&in_buf);
-
-    out_buf->pts = s->next_pts;
-    if (s->next_pts != AV_NOPTS_VALUE)
-        s->next_pts += nb_samples;
-
-    return ff_filter_frame(outlink, out_buf);
-}
-
-/**
- * Returns the smallest number of samples available in the input FIFOs other
- * than that of the first input.
- */
-static int get_available_samples(MixContext *s)
-{
-    int i;
-    int available_samples = INT_MAX;
-
-    av_assert0(s->nb_inputs > 1);
-
-    for (i = 1; i < s->nb_inputs; i++) {
-        int nb_samples;
-        if (s->input_state[i] == INPUT_OFF)
-            continue;
-        nb_samples = av_audio_fifo_size(s->fifos[i]);
-        available_samples = FFMIN(available_samples, nb_samples);
-    }
-    if (available_samples == INT_MAX)
-        return 0;
-    return available_samples;
-}
-
-/**
- * Requests a frame, if needed, from each input link other than the first.
- */
-static int request_samples(AVFilterContext *ctx, int min_samples)
-{
-    MixContext *s = ctx->priv;
-    int i, ret;
-
-    av_assert0(s->nb_inputs > 1);
-
-    for (i = 1; i < s->nb_inputs; i++) {
-        ret = 0;
-        if (s->input_state[i] == INPUT_OFF)
-            continue;
-        while (!ret && av_audio_fifo_size(s->fifos[i]) < min_samples)
-            ret = ff_request_frame(ctx->inputs[i]);
-        if (ret == AVERROR_EOF) {
-            if (av_audio_fifo_size(s->fifos[i]) == 0) {
-                s->input_state[i] = INPUT_OFF;
-                continue;
-            }
-        } else if (ret < 0)
-            return ret;
-    }
-    return 0;
-}
 
 /**
  * Calculates the number of active inputs and determines EOF based on the
@@ -384,78 +439,297 @@ static int calc_active_inputs(MixContext *s)
     return 0;
 }
 
+inline static void _vector_fmac_scalar_c(int16_t *dst, const int16_t *src, float mul,
+	int len)
+{
+	int i;
+	for (i = 0; i < len; i++)
+		dst[i] += src[i] * mul;
+}
+
 static int request_frame(AVFilterLink *outlink)
 {
     AVFilterContext *ctx = outlink->src;
     MixContext      *s = ctx->priv;
-    int ret;
-    int wanted_samples, available_samples;
+    int ret, i;
+	int wanted_samples, corrected_pts_start = 0;
+    int64_t pts_start = INT64_MAX, pts_end = INT64_MAX, cur_pts, this_stream_pts_start, this_stream_pts_end;
+	AVFrame *mixed_frame;
+	AVFrame *input_merged_frame;
 
-    ret = calc_active_inputs(s);
-    if (ret < 0)
-        return ret;
 
-    if (s->input_state[0] == INPUT_OFF) {
-        ret = request_samples(ctx, 1);
-        if (ret < 0)
-            return ret;
+    calc_active_inputs(s);
+    if (s->active_inputs != s->nb_inputs) {
+		av_log(ctx, AV_LOG_ERROR, "amix request_frame but at least one of the active inputs is OFF\n");
+		return AVERROR_EOF;
+	}
 
-        ret = calc_active_inputs(s);
-        if (ret < 0)
-            return ret;
+	//lets check if all the inputs have at least one frame
+	for (i = 0; i < ctx->nb_inputs; i++) {
+		cur_pts = this_stream_pts_start = frame_list_next_pts(s->inputs_frame_list[i]);
+		if (cur_pts == AV_NOPTS_VALUE) {
+			av_log(ctx, AV_LOG_DEBUG, "amix request_frame but input idx %d has no frames. trying to request frames ...\n", i);
+			ret = ff_request_frame(ctx->inputs[i]);
+			if (ret == AVERROR_EOF) {
+				av_log(ctx, AV_LOG_ERROR, "amix request_frame but input idx %d has no frames and returned EOF on request frames!\n", i);
+				s->input_state[i] = INPUT_OFF;
+				if (s->nb_inputs == 1)
+					return AVERROR_EOF;
+				else
+					return AVERROR(EAGAIN);
+			} else if (ret == AVERROR(EAGAIN)) {
+				//no data still available ...
+				return ret;
+			}
+			else if (ret < 0) {
+				av_log(ctx, AV_LOG_ERROR, "amix request_frame but input idx %d has no frames and returned %d on request frames!\n", i, ret);
+            	return ret;
+			}
+			cur_pts = this_stream_pts_start = frame_list_next_pts(s->inputs_frame_list[i]);
+		}
+		
+		if (cur_pts != AV_NOPTS_VALUE && cur_pts < pts_start) {
+			pts_start = cur_pts;
+		}
+		
+		cur_pts = this_stream_pts_end = frame_list_last_pts(s->inputs_frame_list[i]);
+		/*while (1000LL * (this_stream_pts_end - this_stream_pts_start) / s->sample_rate < MIN_CACHE_MILLISECONDS) {
+			//av_log(ctx, AV_LOG_INFO, "amix request_frame but input idx %d has not enough frames. trying to request frames ...\n", i);
+			ret = ff_request_frame(ctx->inputs[i]);
+			if (ret == AVERROR_EOF) {
+				av_log(ctx, AV_LOG_ERROR, "amix request_frame but input idx %d has no frames and returned EOF on request frames!\n", i);
+				s->input_state[i] = INPUT_OFF;
+				if (s->nb_inputs == 1)
+					return AVERROR_EOF;
+				else
+					return AVERROR(EAGAIN);
+			}
+			else if (ret == AVERROR(EAGAIN)) {
+				//no data still available ...
+				return ret;
+			}
+			else if (ret < 0) {
+				av_log(ctx, AV_LOG_ERROR, "amix request_frame but input idx %d has no frames and returned %d on request frames!\n", i, ret);
+				return ret;
+			}
+			cur_pts = this_stream_pts_end = frame_list_last_pts(s->inputs_frame_list[i]);
+		}*/
+		if (cur_pts != AV_NOPTS_VALUE && cur_pts < pts_end) {
+					pts_end = cur_pts;
+		}
+	}
+	//av_log(ctx, AV_LOG_WARNING, "amix request_frame seems that all inputs have some frames ...\n");
 
-        available_samples = get_available_samples(s);
-        if (!available_samples)
-            return AVERROR(EAGAIN);
+	if (pts_end == INT64_MAX || pts_start == INT64_MAX || pts_start >= pts_end) {
+		av_log(ctx, AV_LOG_ERROR, "amix request_frame but global pts_start %ld is not coherent with pts_end %ld\n", pts_start, pts_end);
+		return AVERROR(EAGAIN);
+	}
 
-        return output_frame(outlink, available_samples);
-    }
+	//to allow the arriving of old packets we keep a cache of at least CONSUME_CACHE_MILLISECONDS (MIN_CACHE_MILLISECONDS = 2*CONSUME_CACHE_MILLISECONDS)
+	/*if (1000LL * (pts_end - pts_start) / s->sample_rate < MIN_CACHE_MILLISECONDS) {
+		av_log(ctx, AV_LOG_ERROR, "amix request_frame but queues contains only %lld ms instead of %lld ms\n", 1000LL * (pts_end - pts_start) / s->sample_rate, MIN_CACHE_MILLISECONDS);
+		return AVERROR(EAGAIN);
+	}
+	av_log(ctx, AV_LOG_INFO, "amix request_frame updating pts_end %ld to %ld ...\n", pts_end, (int64_t)( pts_end - (int64_t)(CONSUME_CACHE_MILLISECONDS * s->sample_rate) / (int64_t)1000LL));
+	pts_end = pts_end - (int64_t)(CONSUME_CACHE_MILLISECONDS * s->sample_rate) / (int64_t)1000LL;
 
-    if (s->frame_list->nb_frames == 0) {
-        ret = ff_request_frame(ctx->inputs[0]);
-        if (ret == AVERROR_EOF) {
-            s->input_state[0] = INPUT_OFF;
-            if (s->nb_inputs == 1)
-                return AVERROR_EOF;
-            else
-                return AVERROR(EAGAIN);
-        } else if (ret < 0)
-            return ret;
-    }
-    av_assert0(s->frame_list->nb_frames > 0);
+	if (pts_start >= pts_end) {
+		av_log(ctx, AV_LOG_ERROR, "amix request_frame but update of pts_end to keep at least CONSUME_CACHE_MILLISECONDS set a not coherent pts_end %ld with pts_start %ld\n", pts_end, pts_start);
+		return AVERROR(EAGAIN);
+	}*/
 
-    wanted_samples = frame_list_next_frame_size(s->frame_list);
+	//in case we have lost frames on all the input channels we must insert silence also for the corresponding
+	// window.
+	//eg.
+	// stream1   |XXXXXXX|    |---------|
+	// stream2 |XXXXXXXXX|   |------|
+	// pts_start             ^
+	// pts_end                      ^
+	// last_output_pts   ^
+	// new window        ^----------^
+	if (pts_start > s->last_output_pts && s->last_output_pts != AV_NOPTS_VALUE) {
+		av_log(ctx, AV_LOG_ERROR, "amix request_frame but global last_output_pts %ld is less than one of the queue pts_start %ld. This can happen if we have lost some packets... Generating silence for %ld samples ...\n", s->last_output_pts, pts_start, (pts_start - s->last_output_pts));
+		pts_start = s->last_output_pts;
+		corrected_pts_start = 1;
+	} else if (pts_start < s->last_output_pts && s->last_output_pts != AV_NOPTS_VALUE) {
+		if (s->last_output_pts - pts_start > 2) {
+			av_log(ctx, AV_LOG_INFO, "amix request_frame but global last_output_pts %ld is later than one of the queue pts_start %ld. This can happen if we have received some packets too late or received an RTCP NTP update on an instable stream. Discarding the too late part ...\n", s->last_output_pts, pts_start);
+		}
+		pts_start = s->last_output_pts;
+		corrected_pts_start = 1;
+	}
+    wanted_samples = pts_end - pts_start;
+	if (wanted_samples <= 0) {
+		if (corrected_pts_start) {
+			av_log(ctx, AV_LOG_WARNING, "amix request_frame but global pts_end %ld is less than pts_start %ld due to the correction of pts_start with last_output_pts %ld. This can happen if we have received some packets too late or received an RTCP NTP update on an instable stream. Clearing samples up to last_output_pts ...\n", pts_end, pts_start, s->last_output_pts);
+			pts_end = pts_start;
+			wanted_samples = pts_end - pts_start;
+		}
+		else {
+			av_log(ctx, AV_LOG_ERROR, "amix request_frame but global pts_end %ld is less than pts_start %ld but no correction was performed (last_output_pts %ld). This can happen if the queue sequence is broken!!! Exiting with ENOMEM...\n", pts_end, pts_start, s->last_output_pts);
+			return AVERROR(ENOMEM);
+		}
+	}
 
-    if (s->active_inputs > 1) {
-        ret = request_samples(ctx, wanted_samples);
-        if (ret < 0)
-            return ret;
 
-        ret = calc_active_inputs(s);
-        if (ret < 0)
-            return ret;
-    }
+ 
+	//calculate scaling factor needed to mix audios
+	calculate_scales(s);
 
-    if (s->active_inputs > 1) {
-        available_samples = get_available_samples(s);
-        if (!available_samples)
-            return AVERROR(EAGAIN);
-        available_samples = FFMIN(available_samples, wanted_samples);
-    } else {
-        available_samples = wanted_samples;
-    }
+	if (wanted_samples > 0) {
+		mixed_frame = ff_get_audio_buffer(outlink, wanted_samples);
+		if (!mixed_frame) {
+			av_log(ctx, AV_LOG_ERROR, "amix request_frame CANNOT ALLOCATE MIXED FRAME (wanted_samples: %d, pts_start: %ld, pts_end: %ld) !!!!\n", wanted_samples, pts_start, pts_end);
+			return AVERROR(ENOMEM);
+		}
+		input_merged_frame = ff_get_audio_buffer(outlink, wanted_samples);
+		if (!input_merged_frame) {
+			av_log(ctx, AV_LOG_ERROR, "amix request_frame CANNOT ALLOCATE INPUT MERGED FRAME (wanted_samples: %d, pts_start: %ld, pts_end: %ld) !!!!\n", wanted_samples, pts_start, pts_end);
+			return AVERROR(ENOMEM);
+		}
+	}
+	
 
-    s->next_pts = frame_list_next_pts(s->frame_list);
-    frame_list_remove_samples(s->frame_list, available_samples);
+	//ok, now we have to mix all the inputs considering that frames can be not contiguous in a single input and also
+	// that each input can start after pts_start, eg:
+	//INPUT0 [ 0_9]->[10-19]->[20-49]
+	//INPUT1 [20-29]->[30-39]
+	//INPUT2 [35-39]
+	// pts_start = 0
+	// pts_end = 39
 
-    return output_frame(outlink, available_samples);
+	for (i = 0; i < s->nb_inputs; i++) {
+		int planes, plane_size, p;
+		int64_t samples_copied = 0, missed_msecs = 0;
+		//av_log(ctx, AV_LOG_WARNING, "amix request_frame loop input %d to mix ...\n", i);
+
+		cur_pts = frame_list_next_pts(s->inputs_frame_list[i]);
+		if (wanted_samples > 0) {
+			av_samples_set_silence(input_merged_frame->extended_data, 0, wanted_samples, s->nb_channels, outlink->format);
+		}
+
+		//we should use frames of this input until the start of the frame is included in the pts_start<->pts_end window
+		while(cur_pts < pts_end && cur_pts != AV_NOPTS_VALUE) {
+			//av_log(ctx, AV_LOG_WARNING, "amix request_frame loop input %d to mix cur_pts %ld pts_start %ld pts_end %ld...\n", i, cur_pts, pts_start, pts_end);
+			//copy the current frame buffer in the destination buffer considering the offsets
+			//eg
+			// pts_start 40
+			// pts_end   100
+			// this_frame->pts_start 20
+			// this_frame->pts_end   110
+			// out buffer   |-------------------|
+			// frame buffer      |XXXXXXXXXXXXXX----|
+
+			FrameInfo *frame_info = s->inputs_frame_list[i]->list;
+			AVFrame *frame = frame_info->frame;
+			int64_t copy_pts_end = frame_info->pts + frame_info->length_pts;
+			int64_t copy_pts_start = cur_pts;
+			
+			//check if this frame ends after the start of the pts_start<->pts_end window to discard frames of the following case:
+			// out buffer            |--------------|
+			// frame buffer |-----|
+			if (copy_pts_end > pts_start) {
+				if (copy_pts_start < pts_start) {
+					//check if this frame start before the start of the pts_start<->pts_end window:
+					// out buffer      |--------------|
+					// frame buffer |---XXXXX|
+					copy_pts_start = pts_start;
+				}
+				if (copy_pts_end > pts_end) {
+					//check if this frame ends after the pts_start<->pts_end window:
+					// out buffer      |--------------|
+					// frame buffer			|XXXXXXXXX-----|
+					copy_pts_end = pts_end;
+				}
+				//copy the samples from the frame to the 
+				if (wanted_samples > 0) {
+					if (av_samples_copy(input_merged_frame->extended_data, frame->extended_data,
+						copy_pts_start - pts_start, //dest offset
+						copy_pts_start - frame_info->pts, //src offset
+						copy_pts_end - copy_pts_start, //samples
+						s->nb_channels, frame->format) < 0) {
+						av_log(ctx, AV_LOG_ERROR, "amix request_frame av_samples_copy RETURNED ERROR (copy_pts_start: %ld, copy_pts_end: %ld, pts_start: %ld, frame_info->pts: %ld) !!!!\n", copy_pts_start, copy_pts_end, pts_start, frame_info->pts);
+						return AVERROR(ENOMEM);
+					}
+				}
+				samples_copied += copy_pts_end - copy_pts_start;
+
+				if (copy_pts_end >= frame_info->pts + frame_info->length_pts) {
+					//we have consumed all the samples in this frame. drop it ...
+					// out buffer   |--------------|
+					// frame buffer	    |XXXXXXXXX|
+					s->inputs_frame_list[i]->list = frame_info->next;
+					av_frame_free(&frame_info->frame);
+					av_freep(&frame_info);
+					if (s->inputs_frame_list[i]->list == NULL) {
+						s->inputs_frame_list[i]->end = NULL;
+					}
+				} else {
+					//(copy_pts_end < pts_end) there is still something in the frame. keep it and update the offset ...
+					// out buffer   |--------------|
+					// frame buffer	         |XXXXX----|
+					frame_info->offset = copy_pts_end - frame_info->pts;
+				}
+
+			} else {
+				//this sample has been totally discarded. drop it ...
+				// out buffer            |--------------|
+				// frame buffer |----|
+				s->inputs_frame_list[i]->list = frame_info->next;
+				av_frame_free(&frame_info->frame);
+				av_freep(&frame_info);
+				if (s->inputs_frame_list[i]->list == NULL) {
+					s->inputs_frame_list[i]->end = NULL;
+				}
+			}
+
+			//update the cur_pts with the new frame head
+			cur_pts = frame_list_next_pts(s->inputs_frame_list[i]);
+		}
+		//here we have merged all the interested frames of this input into input_audio_data
+		//now we mix all the planes of input_audio_data into mix_audio_data
+		if (wanted_samples > 0) {
+			planes = s->planar ? s->nb_channels : 1;
+			plane_size = wanted_samples * (s->planar ? 1 : s->nb_channels);
+			plane_size = FFALIGN(plane_size, 16);
+
+			for (p = 0; p < planes; p++) {
+				/*s->fdsp->vector_fmac_scalar((float *)mixed_frame->extended_data[p], //dest
+											(float *)input_merged_frame->extended_data[p], //source
+											s->input_scale[i], plane_size);*/
+				_vector_fmac_scalar_c((int16_t *)mixed_frame->extended_data[p], //dest
+					(int16_t *)input_merged_frame->extended_data[p], //source
+					s->input_scale[i], plane_size);
+			}
+
+			missed_msecs = (1000 * (wanted_samples - samples_copied)) / s->sample_rate;
+			if (missed_msecs > 1) {
+				av_log(ctx, AV_LOG_INFO, "amix stream idx %d lost %ld milliseconds of audio...\n", i, missed_msecs);
+			}
+		}
+	}
+	//av_log(ctx, AV_LOG_WARNING, "amix request_frame mixed_frame with pts_start %ld !!!!!!\n", pts_start);
+	if (wanted_samples > 0) {
+		mixed_frame->pts = pts_start;
+		s->last_output_pts = pts_end;
+		av_frame_free(&input_merged_frame);
+
+		return ff_filter_frame(outlink, mixed_frame);
+	}
+	else {
+		return AVERROR(EAGAIN);
+	}
+
 }
+
+
 
 static int filter_frame(AVFilterLink *inlink, AVFrame *buf)
 {
     AVFilterContext  *ctx = inlink->dst;
     MixContext       *s = ctx->priv;
     AVFilterLink *outlink = ctx->outputs[0];
+	int64_t pts;
     int i, ret = 0;
 
     for (i = 0; i < ctx->nb_inputs; i++)
@@ -467,16 +741,16 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *buf)
         goto fail;
     }
 
-    if (i == 0) {
-        int64_t pts = av_rescale_q(buf->pts, inlink->time_base,
-                                   outlink->time_base);
-        ret = frame_list_add_frame(s->frame_list, buf->nb_samples, pts);
-        if (ret < 0)
-            goto fail;
-    }
+	//av_log(ctx, AV_LOG_INFO, "amix filter_frame adding frame input idx: %d, orig pts: %ld, pts: %ld, samples: %d, length_in_pts %ld\n", i, buf->pts, av_rescale_q(buf->pts, inlink->time_base, outlink->time_base), buf->nb_samples, av_rescale_q(buf->nb_samples, (AVRational){ 1, inlink->sample_rate }, inlink->time_base));
 
-    ret = av_audio_fifo_write(s->fifos[i], (void **)buf->extended_data,
-                              buf->nb_samples);
+	pts = av_rescale_q(buf->pts, inlink->time_base,
+							   outlink->time_base);
+	if (pts == 0) {
+		av_log(ctx, AV_LOG_WARNING, "amix filter_frame input idx %d adding frame with rescaled pts %ld (buf->pts = %ld)!\n", i, pts, buf->pts);
+	}
+	ret = frame_list_add_frame(s->inputs_frame_list[i], buf, pts, s, outlink, i);
+	if (ret < 0)
+		goto fail;
 
 fail:
     av_frame_free(&buf);
@@ -515,13 +789,13 @@ static av_cold void uninit(AVFilterContext *ctx)
     int i;
     MixContext *s = ctx->priv;
 
-    if (s->fifos) {
-        for (i = 0; i < s->nb_inputs; i++)
-            av_audio_fifo_free(s->fifos[i]);
-        av_freep(&s->fifos);
+   
+    if (s->inputs_frame_list) {
+	        for (i = 0; i < s->nb_inputs; i++) {
+	    		frame_list_clear(s->inputs_frame_list[i]);
+			}
+	        av_freep(&s->inputs_frame_list);
     }
-    frame_list_clear(s->frame_list);
-    av_freep(&s->frame_list);
     av_freep(&s->input_state);
     av_freep(&s->input_scale);
     av_freep(&s->fdsp);
@@ -541,8 +815,8 @@ static int query_formats(AVFilterContext *ctx)
     if (!layouts)
         return AVERROR(ENOMEM);
 
-    ff_add_format(&formats, AV_SAMPLE_FMT_FLT);
-    ff_add_format(&formats, AV_SAMPLE_FMT_FLTP);
+	ff_add_format(&formats, AV_SAMPLE_FMT_S16);
+	ff_add_format(&formats, AV_SAMPLE_FMT_S16P);
     ret = ff_set_common_formats(ctx, formats);
     if (ret < 0)
         return ret;

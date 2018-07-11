@@ -911,8 +911,14 @@ int64_t swr_next_pts(struct SwrContext *s, int64_t pts){
         if(fabs(fdelta) > s->min_compensation) {
             if(s->outpts == s->firstpts || fabs(fdelta) > s->min_hard_compensation){
                 int ret;
-                if(delta > 0) ret = swr_inject_silence(s,  delta / s->out_sample_rate);
-                else          ret = swr_drop_output   (s, -delta / s-> in_sample_rate);
+                if(delta > 0) {
+			if(fdelta > 0.5) {
+				av_log(s, AV_LOG_WARNING, "Compensating long (>0.5 secs) audio delta ...\n");
+			}
+			ret = swr_inject_silence(s,  delta / s->out_sample_rate);
+		} else {
+		        ret = swr_drop_output   (s, -delta / s-> in_sample_rate);
+		}
                 if(ret<0){
                     av_log(s, AV_LOG_ERROR, "Failed to compensate for timestamp delta of %f\n", fdelta);
                 }

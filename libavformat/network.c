@@ -93,8 +93,10 @@ int ff_network_wait_fd_timeout(int fd, int write, int64_t timeout, AVIOInterrupt
         if (timeout > 0) {
             if (!wait_start)
                 wait_start = av_gettime_relative();
-            else if (av_gettime_relative() - wait_start > timeout)
+            else if (av_gettime_relative() - wait_start > timeout) {
+        av_log(NULL, AV_LOG_WARNING, "ff_network_wait_fd_timeout ETIMEDOUT");
                 return AVERROR(ETIMEDOUT);
+}
         }
     }
 }
@@ -156,8 +158,10 @@ static int ff_poll_interrupt(struct pollfd *p, nfds_t nfds, int timeout,
             break;
     } while (timeout <= 0 || runs-- > 0);
 
-    if (!ret)
+    if (!ret) {
+        av_log(NULL, AV_LOG_WARNING, "ff_poll_interrupt ETIMEDOUT");
         return AVERROR(ETIMEDOUT);
+}
     if (ret < 0)
         return AVERROR(errno);
     return ret;

@@ -261,9 +261,11 @@ static void rtcp_send_sr(AVFormatContext *s1, int64_t ntp_time, int bye)
 {
     RTPMuxContext *s = s1->priv_data;
     uint32_t rtp_ts;
-
-    av_log(s1, AV_LOG_TRACE, "RTCP: %02x %"PRIx64" %x\n", s->payload_type, ntp_time, s->timestamp);
-
+	//int64_t ntp_secs = (ntp_time / 1000000LL);
+	//int64_t rtp_ntp_time = (ntp_time / 1000000LL) << 32 | (((ntp_time - (ntp_time / 1000000LL) * 1000000LL) * 65536LL / 1000000LL) << 16);
+	int64_t rtp_ntp_time = NTP_TO_RTP_FORMAT(ntp_time);
+	av_log(s1, AV_LOG_TRACE, "RTCP: %02x ntp_ts %"PRIx64" rtp_ntp_time %"PRIx64" %x\n", s->payload_type, ntp_time, rtp_ntp_time , s->timestamp);
+	
     s->last_rtcp_ntp_time = ntp_time;
     rtp_ts = av_rescale_q(ntp_time - s->first_rtcp_ntp_time, (AVRational){1, 1000000},
                           s1->streams[0]->time_base) + s->base_timestamp;
@@ -271,7 +273,7 @@ static void rtcp_send_sr(AVFormatContext *s1, int64_t ntp_time, int bye)
     avio_w8(s1->pb, RTCP_SR);
     avio_wb16(s1->pb, 6); /* length in words - 1 */
     avio_wb32(s1->pb, s->ssrc);
-    avio_wb64(s1->pb, NTP_TO_RTP_FORMAT(ntp_time));
+    avio_wb64(s1->pb, rtp_ntp_time);
     avio_wb32(s1->pb, rtp_ts);
     avio_wb32(s1->pb, s->packet_count);
     avio_wb32(s1->pb, s->octet_count);

@@ -53,8 +53,9 @@
 /* Timeout values for socket poll, in ms,
  * and read_packet(), in seconds  */
 #define POLL_TIMEOUT_MS 100
-#define READ_PACKET_TIMEOUT_S 10
-#define MAX_TIMEOUTS READ_PACKET_TIMEOUT_S * 1000 / POLL_TIMEOUT_MS
+#define READ_ALL_STREAMS_PACKET_TIMEOUT_S 10
+#define MAX_ALL_STREAMS_TIMEOUTS READ_ALL_STREAMS_PACKET_TIMEOUT_S * 1000 / POLL_TIMEOUT_MS
+#define SINGLE_STREAM_TIMEOUT_MS 20000
 #define SDP_MAX_SIZE 16384
 #define RECVBUF_SIZE 10 * RTP_MAX_PACKET_LENGTH
 #define DEFAULT_REORDERING_DELAY 100000
@@ -447,6 +448,7 @@ static void sdp_parse_line(AVFormatContext *s, SDPParseState *s1,
         if (!rtsp_st)
             return;
         rtsp_st->stream_index = -1;
+        rtsp_st->last_received_event_time_ms = -1;
         dynarray_add(&rt->rtsp_streams, &rt->nb_rtsp_streams, rtsp_st);
 
         rtsp_st->sdp_ip = s1->default_ip;
@@ -672,6 +674,9 @@ int ff_sdp_parse(AVFormatContext *s, const char *content)
      * in rtpdec_xiph.c. */
     char buf[16384], *q;
     SDPParseState sdp_parse_state = { { 0 } }, *s1 = &sdp_parse_state;
+
+	rt->common_first_rtcp_ntp_time = AV_NOPTS_VALUE;
+	rt->common_first_rtcp_timestamp = 0;
 
     p = content;
     for (;;) {
@@ -1908,9 +1913,13 @@ static int udp_read_packet(AVFormatContext *s, RTSPStream **prtsp_st,
     struct pollfd *p = rt->p;
     int *fds = NULL, fdsnum, fdsidx;
 
+    int64_t read_time_ms;
+	
+
+
     for (;;) {
         if (ff_check_interrupt(&s->interrupt_callback))
-            return AVERROR_EXIT;
+           return AVERROR_EXIT;
         if (wait_end && wait_end - av_gettime_relative() < 0)
             return AVERROR(EAGAIN);
         max_p = 0;
@@ -1921,9 +1930,18 @@ static int udp_read_packet(AVFormatContext *s, RTSPStream **prtsp_st,
         } else {
             tcp_fd = -1;
         }
+        
+		read_time_ms = av_gettime_relative() / 1000;
         for (i = 0; i < rt->nb_rtsp_streams; i++) {
             rtsp_st = rt->rtsp_streams[i];
             if (rtsp_st->rtp_handle) {
+				//check if the stream reached timeout after having started reading
+				RTPDemuxContext *rtpctx = rtsp_st->transport_priv;
+				if (rtpctx->last_decoded_time_us != 0 && read_time_ms - rtpctx->last_decoded_time_us / 1000 > SINGLE_STREAM_TIMEOUT_MS) {
+					av_log(s, AV_LOG_WARNING, "udp_read_packet stream idx %d reached SINGLE_STREAM_TIMEOUT_MS %d\n", i, SINGLE_STREAM_TIMEOUT_MS);
+            		return AVERROR(ETIMEDOUT);
+				}
+
                 if (ret = ffurl_get_multi_file_handle(rtsp_st->rtp_handle,
                                                       &fds, &fdsnum)) {
                     av_log(s, AV_LOG_ERROR, "Unable to recover rtp ports\n");
@@ -1936,28 +1954,47 @@ static int udp_read_packet(AVFormatContext *s, RTSPStream **prtsp_st,
                 }
                 for (fdsidx = 0; fdsidx < fdsnum; fdsidx++) {
                     p[max_p].fd       = fds[fdsidx];
-                    p[max_p++].events = POLLIN;
+                    p[max_p++].events = POLLIN | POLLPRI;
                 }
                 av_freep(&fds);
             }
         }
-        n = poll(p, max_p, POLL_TIMEOUT_MS);
+
+		n = poll(p, max_p, POLL_TIMEOUT_MS);
+
         if (n > 0) {
+			int oldest_read_stream_idx = -1;
+			int64_t oldest_time_ms = INT64_MAX;
+
+
             int j = 1 - (tcp_fd == -1);
             timeout_cnt = 0;
             for (i = 0; i < rt->nb_rtsp_streams; i++) {
                 rtsp_st = rt->rtsp_streams[i];
                 if (rtsp_st->rtp_handle) {
-                    if (p[j].revents & POLLIN || p[j+1].revents & POLLIN) {
-                        ret = ffurl_read(rtsp_st->rtp_handle, buf, buf_size);
-                        if (ret > 0) {
-                            *prtsp_st = rtsp_st;
-                            return ret;
-                        }
+                    if (p[j].revents & POLLIN || p[j+1].revents & POLLIN || p[j].revents & POLLPRI || p[j+1].revents & POLLPRI) {
+						//we have something to read from this stream. prioritize the read from the most "delayed" stream.
+						if(rtsp_st->last_received_event_time_ms < oldest_time_ms) {
+							oldest_read_stream_idx = i;
+							oldest_time_ms = rtsp_st->last_received_event_time_ms;
+						}
                     }
                     j+=2;
                 }
             }
+
+            if(oldest_read_stream_idx >= 0) {
+				//we got at least one ready stream
+				// update last_received_event_time_ms with the current timestamp, read data and return it to caller
+				read_time_ms = av_gettime_relative()/1000;
+				rt->rtsp_streams[oldest_read_stream_idx]->last_received_event_time_ms = read_time_ms;
+				ret = ffurl_read(rt->rtsp_streams[oldest_read_stream_idx]->rtp_handle, buf, buf_size);
+				if (ret > 0) {
+					*prtsp_st = rt->rtsp_streams[oldest_read_stream_idx];
+					return ret;
+				}
+
+			}
 #if CONFIG_RTSP_DEMUXER
             if (tcp_fd != -1 && p[0].revents & POLLIN) {
                 if (rt->rtsp_flags & RTSP_FLAG_LISTEN) {
@@ -1980,11 +2017,27 @@ static int udp_read_packet(AVFormatContext *s, RTSPStream **prtsp_st,
                 }
             }
 #endif
-        } else if (n == 0 && ++timeout_cnt >= MAX_TIMEOUTS) {
-            return AVERROR(ETIMEDOUT);
-        } else if (n < 0 && errno != EINTR)
-            return AVERROR(errno);
-    }
+        } else if (n == 0) {
+				if(++timeout_cnt >= MAX_ALL_STREAMS_TIMEOUTS) {
+					av_log(s, AV_LOG_ERROR, "udp_read_packet MAX_ALL_STREAMS_TIMEOUTS %d reached\n",MAX_ALL_STREAMS_TIMEOUTS);
+					return AVERROR(ETIMEDOUT);
+				}
+				// !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! IMPORTANT !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+				//The following write to stderr seems to unlock a race condition on poll. In particular it happens in the following scenario:
+				// 1) first poll timeouts
+				// 2) poll succeed for some reads
+				// 3) both the rtp streams stops for a while (packet lost on all streams for a period longer than POLL_TIMEOUT_MS)
+				// 4) poll returns 0
+				// 5) rtp packets incoming flow start again
+				// 6) subsequent poll requests always returns 0 also if incoming traffic is present on all the streams
+				// 7) if a write on stderr is performed the next poll request succeed. if we perform a sleep instead of a write to stderr the poll continues failing
+				if(timeout_cnt % 10 == 1)
+					av_log(s, AV_LOG_INFO, "udp_read_packet poll timeout on all streams, retries left %d ...\n", (MAX_ALL_STREAMS_TIMEOUTS - timeout_cnt));
+				// !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! IMPORTANT !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+        } else if (n < 0 && errno != EINTR) {
+			return AVERROR(errno);
+		}
+	}
 }
 
 static int pick_stream(AVFormatContext *s, RTSPStream **rtsp_st,
@@ -2037,16 +2090,19 @@ int ff_rtsp_fetch_packet(AVFormatContext *s, AVPacket *pkt)
     int ret, len;
     RTSPStream *rtsp_st, *first_queue_st = NULL;
     int64_t wait_end = 0;
+	int i;
 
     if (rt->nb_byes == rt->nb_rtsp_streams)
         return AVERROR_EOF;
+
+	
 
     /* get next frames from the same RTP packet */
     if (rt->cur_transport_priv) {
         if (rt->transport == RTSP_TRANSPORT_RDT) {
             ret = ff_rdt_parse_packet(rt->cur_transport_priv, pkt, NULL, 0);
         } else if (rt->transport == RTSP_TRANSPORT_RTP) {
-            ret = ff_rtp_parse_packet(rt->cur_transport_priv, pkt, NULL, 0);
+            ret = ff_rtp_parse_packet(rt->cur_transport_priv, pkt, NULL, 0, 0);
         } else if (CONFIG_RTPDEC && rt->ts) {
             ret = avpriv_mpegts_parse_packet(rt->ts, pkt, rt->recvbuf + rt->recvbuf_pos, rt->recvbuf_len - rt->recvbuf_pos);
             if (ret >= 0) {
@@ -2066,7 +2122,30 @@ int ff_rtsp_fetch_packet(AVFormatContext *s, AVPacket *pkt)
 
 redo:
     if (rt->transport == RTSP_TRANSPORT_RTP) {
-        int i;
+		//check if the streams contains buffered packets that were waiting for RTCP ntp time
+		for (i = 0; i < rt->nb_rtsp_streams; i++) {
+			RTPDemuxContext *rtpctx = rt->rtsp_streams[i]->transport_priv;
+
+			if (rtpctx->first_rtcp_ntp_time != AV_NOPTS_VALUE && rtpctx->waiting_buffers_queue) {
+				//this stream received RTCP ntp time and have buffered packets. consume them first ...
+				RTPBuffer *buffer = rtpctx->waiting_buffers_queue;
+				av_log(s, AV_LOG_INFO, "RTP stream %d received RTCP ntp time and have buffered packets. consume them first ...\n", i);
+				rtpctx->waiting_buffers_queue = buffer->next;
+				ret = ff_rtp_parse_packet(rtpctx, pkt, &buffer->buf, buffer->len, 1);
+				if (buffer->buf) {
+					av_freep(&buffer->buf);
+				}
+				av_free(buffer);
+				if (rtpctx->waiting_buffers_queue == NULL) {
+					av_log(s, AV_LOG_INFO, "RTP stream %d consumed all buffered queue!\n", i);
+				}
+				goto end;
+			}
+			else {
+				//av_log(s, AV_LOG_INFO, "RTP stream %d not yet received RTCP ntp time (%ld) or buffered packets queue is empty (%ld)...\n", i, rtpctx->first_rtcp_ntp_time, rtpctx->waiting_buffers_queue);
+			}
+		}
+
         int64_t first_queue_time = 0;
         for (i = 0; i < rt->nb_rtsp_streams; i++) {
             RTPDemuxContext *rtpctx = rt->rtsp_streams[i]->transport_priv;
@@ -2122,7 +2201,7 @@ redo:
     if (len == AVERROR(EAGAIN) && first_queue_st &&
         rt->transport == RTSP_TRANSPORT_RTP) {
         rtsp_st = first_queue_st;
-        ret = ff_rtp_parse_packet(rtsp_st->transport_priv, pkt, NULL, 0);
+        ret = ff_rtp_parse_packet(rtsp_st->transport_priv, pkt, NULL, 0, 0);
         goto end;
     }
     if (len < 0)
@@ -2132,7 +2211,7 @@ redo:
     if (rt->transport == RTSP_TRANSPORT_RDT) {
         ret = ff_rdt_parse_packet(rtsp_st->transport_priv, pkt, &rt->recvbuf, len);
     } else if (rt->transport == RTSP_TRANSPORT_RTP) {
-        ret = ff_rtp_parse_packet(rtsp_st->transport_priv, pkt, &rt->recvbuf, len);
+        ret = ff_rtp_parse_packet(rtsp_st->transport_priv, pkt, &rt->recvbuf, len, 0);
         if (rtsp_st->feedback) {
             AVIOContext *pb = NULL;
             if (rt->lower_transport == RTSP_LOWER_TRANSPORT_CUSTOM)
@@ -2148,7 +2227,7 @@ redo:
                  * copy the same value to all other uninitialized streams,
                  * in order to map their timestamp origin to the same ntp time
                  * as this one. */
-                int i;
+                /*int i;
                 AVStream *st = NULL;
                 if (rtsp_st->stream_index >= 0)
                     st = s->streams[rtsp_st->stream_index];
@@ -2164,7 +2243,7 @@ redo:
                             rtpctx->rtcp_ts_offset, st->time_base,
                             st2->time_base);
                     }
-                }
+                }*/
                 // Make real NTP start time available in AVFormatContext
                 if (s->start_time_realtime == AV_NOPTS_VALUE) {
                     s->start_time_realtime = av_rescale (rtpctx->first_rtcp_ntp_time - (NTP_OFFSET << 32), 1000000, 1LL << 32);

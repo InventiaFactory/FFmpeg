@@ -224,6 +224,13 @@ typedef struct RTSPState {
 
     struct RTSPStream **rtsp_streams; /**< streams in this session */
 
+	/**
+	* rtcp ntp time set by the first stream that received an rtcp packet
+	* this is used to make a common starting timestamp between all the streams
+	*/
+	int64_t common_first_rtcp_ntp_time;
+	uint32_t common_first_rtcp_timestamp;
+
     /** indicator of whether we are currently receiving data from the
      * server. Basically this isn't more than a simple cache of the
      * last PLAY/PAUSE command sent to the server, to make sure we don't
@@ -468,6 +475,7 @@ typedef struct RTSPStream {
 
     char crypto_suite[40];
     char crypto_params[100];
+    int64_t last_received_event_time_ms;
 } RTSPStream;
 
 void ff_rtsp_parse_line(RTSPMessageHeader *reply, const char *buf,

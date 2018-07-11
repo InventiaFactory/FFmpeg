@@ -29,6 +29,7 @@
 #include "url.h"
 #include "rtpdec.h"
 #include "rtpdec_formats.h"
+#include "rtsp.h"
 
 #define MIN_FEEDBACK_INTERVAL 200000 /* 200 ms in us */
 
@@ -144,6 +145,7 @@ static int rtcp_parse_packet(RTPDemuxContext *s, const unsigned char *buf,
                              int len)
 {
     int payload_len;
+	RTSPState *rtsp_state = s->ic->priv_data;  
     while (len >= 4) {
         payload_len = FFMIN(len, (AV_RB16(buf + 2) + 1) * 4);
 
@@ -154,16 +156,69 @@ static int rtcp_parse_packet(RTPDemuxContext *s, const unsigned char *buf,
                        "Invalid length for RTCP SR packet\n");
                 return AVERROR_INVALIDDATA;
             }
-
-            s->last_rtcp_reception_time = av_gettime_relative();
-            s->last_rtcp_ntp_time  = AV_RB64(buf + 8);
-            s->last_rtcp_timestamp = AV_RB32(buf + 16);
+			
+			
+		
+			s->last_rtcp_reception_time = av_gettime_relative();
+			s->last_rtcp_ntp_time  = AV_RB64(buf + 8);
+			s->last_rtcp_timestamp = AV_RB32(buf + 16);
             if (s->first_rtcp_ntp_time == AV_NOPTS_VALUE) {
+				av_log(NULL, AV_LOG_INFO,
+					"Got first RTCP packet from stream with NTP time %ld. Updating base_timestamp from %d to %d...\n", s->last_rtcp_ntp_time, s->base_timestamp, s->last_rtcp_timestamp);
                 s->first_rtcp_ntp_time = s->last_rtcp_ntp_time;
-                if (!s->base_timestamp)
-                    s->base_timestamp = s->last_rtcp_timestamp;
-                s->rtcp_ts_offset = (int32_t)(s->last_rtcp_timestamp - s->base_timestamp);
-            }
+				//ag
+				if (s->base_timestamp) {
+					av_log(NULL, AV_LOG_ERROR, "rtcp_parse_packet received first ntp timestamp but base_timestamp wasl already set!!!! BUG!\n");
+					return AVERROR(AVERROR_BUG);
+				}
+				s->base_timestamp = s->last_rtcp_timestamp;
+
+				//we need to find if another stream already received at least an rtcp packet and calculate the offset of this stream.
+				//N = first NTP timestamp
+				//this  stream          N------
+				//other stream    N------------
+				//rtcp_ts_offset  XXXXXXX (rebased on time base)
+				if (rtsp_state->common_first_rtcp_ntp_time == AV_NOPTS_VALUE) {
+					rtsp_state->common_first_rtcp_ntp_time = s->first_rtcp_ntp_time;
+					rtsp_state->common_first_rtcp_timestamp = s->last_rtcp_timestamp;
+					av_log(NULL, AV_LOG_INFO,
+						"This RTCP packet is the first of all the streams. Using it's NTP timestamp (%ld) and pts (%d) as a base.\n", rtsp_state->common_first_rtcp_ntp_time, rtsp_state->common_first_rtcp_timestamp);
+				}
+				/* convert to the PTS timebase */
+				s->rtcp_ts_offset = av_rescale(s->first_rtcp_ntp_time - rtsp_state->common_first_rtcp_ntp_time,
+					s->st->time_base.den,
+					(uint64_t)s->st->time_base.num << 32);// + (int64_t)rtsp_state->common_first_rtcp_timestamp - (int64_t)s->last_rtcp_timestamp;
+
+				av_log(NULL, AV_LOG_INFO,
+					"Calculated RTCP timestamp offset (%ld) of this stream NTP (%ld) (pts %d) compared to the first stream NTP received (%ld) (pts %d).\n", 
+					s->rtcp_ts_offset,
+					s->first_rtcp_ntp_time,
+					s->last_rtcp_timestamp,
+					rtsp_state->common_first_rtcp_ntp_time,
+					rtsp_state->common_first_rtcp_timestamp
+					);
+
+
+                //ag old implementation
+				//s->rtcp_ts_offset = (int32_t)(s->last_rtcp_timestamp - s->base_timestamp);
+			} else {
+				//uncomment the following lines to log clock drifts for each stream
+				//NOTE: we have experienced strange drifts on audio with kurento. The drifts are consistent but changes over the time (eg. 59, -16, 17, 66). Amix detects these drifts 
+				// and cut, append silence to compensate it.
+
+				/*int64_t addend;
+				int64_t delta_timestamp;
+
+				// compute pts from timestamp with received ntp_time 
+				delta_timestamp = (int64_t)s->base_timestamp - (int64_t)s->last_rtcp_timestamp;
+				// convert to the PTS timebase 
+				addend = av_rescale(s->last_rtcp_ntp_time - s->first_rtcp_ntp_time,
+					s->st->time_base.den,
+					(uint64_t)s->st->time_base.num << 32);
+				
+				av_log(NULL, AV_LOG_INFO, "Got RTCP update for SSRC %d payload_type %d with addend+delta %ld...\n", s->ssrc, s->payload_type, (addend + delta_timestamp));
+				*/
+			}
 
             break;
         case RTCP_BYE:
@@ -520,6 +575,8 @@ RTPDemuxContext *ff_rtp_parse_open(AVFormatContext *s1, AVStream *st,
     s->ic                  = s1;
     s->st                  = st;
     s->queue_size          = queue_size;
+	s->waiting_buffers_queue = NULL;
+	s->last_decoded_time_us = 0;
     rtp_init_statistics(&s->statistics, 0);
     if (st) {
         switch (st->codec->codec_id) {
@@ -558,28 +615,53 @@ void ff_rtp_parse_set_crypto(RTPDemuxContext *s, const char *suite,
  */
 static void finalize_packet(RTPDemuxContext *s, AVPacket *pkt, uint32_t timestamp)
 {
-    if (pkt->pts != AV_NOPTS_VALUE || pkt->dts != AV_NOPTS_VALUE)
-        return; /* Timestamp already set by depacketizer */
+	int i;
+	if (pkt->pts != AV_NOPTS_VALUE || pkt->dts != AV_NOPTS_VALUE) {
+		//av_log(NULL, AV_LOG_WARNING, "RTP finalize_packet: packet PTS %ld was already set by someone else!!!!!!\n",  pkt->pts);
+		s->last_decoded_time_us = av_gettime_relative();
+		return; /* Timestamp already set by depacketizer */
+	}
+        
     if (timestamp == RTP_NOTS_VALUE)
         return;
 
     if (s->last_rtcp_ntp_time != AV_NOPTS_VALUE && s->ic->nb_streams > 1) {
         int64_t addend;
-        int delta_timestamp;
+        int64_t delta_timestamp;
 
         /* compute pts from timestamp with received ntp_time */
-        delta_timestamp = timestamp - s->last_rtcp_timestamp;
+		delta_timestamp = (int64_t)timestamp - (int64_t)s->last_rtcp_timestamp;
         /* convert to the PTS timebase */
         addend = av_rescale(s->last_rtcp_ntp_time - s->first_rtcp_ntp_time,
                             s->st->time_base.den,
                             (uint64_t) s->st->time_base.num << 32);
+
+
+
         pkt->pts = s->range_start_offset + s->rtcp_ts_offset + addend +
                    delta_timestamp;
+		
+		RTSPState *rtsp_state = s->ic->priv_data;
+		for (i = 0; i < rtsp_state->nb_rtsp_streams; i++) {
+			if (rtsp_state->rtsp_streams[i]->transport_priv == s) {
+				break;
+			}
+		}
+		s->last_decoded_time_us = av_gettime_relative();
+		//av_log(NULL, AV_LOG_INFO, "RTP finalize_packet: idx:%d BASE %ld TIMESTAMP %ld PTS %ld\n", i, s->base_timestamp, timestamp, pkt->pts);
         return;
-    }
+	}
+	else if (s->ic->nb_streams > 1) {
+		av_log(NULL, AV_LOG_ERROR, "RTP finalize_packet: trying to recalculate packet timestamp but no rtcp timestamp received yet! Streams desynchronization will be certain!!!!\n");
+	}
+	//ag
+	//av_log(NULL, AV_LOG_INFO, "RTP finalize_packet: BASE %ld TIMESTAMP %ld\n", s->base_timestamp, timestamp);
 
-    if (!s->base_timestamp)
+	//ag
+	//base_timestamp reset the pts to 0 if we have not yet received an rtcp packet
+	if (!s->base_timestamp)
         s->base_timestamp = timestamp;
+	
     /* assume that the difference is INT32_MIN < x < INT32_MAX,
      * but allow the first timestamp to exceed INT32_MAX */
     if (!s->timestamp)
@@ -589,6 +671,10 @@ static void finalize_packet(RTPDemuxContext *s, AVPacket *pkt, uint32_t timestam
     s->timestamp = timestamp;
     pkt->pts     = s->unwrapped_timestamp + s->range_start_offset -
                    s->base_timestamp;
+	
+	s->last_decoded_time_us = av_gettime_relative();
+	//ag
+	//av_log(NULL, AV_LOG_INFO, "RTP finalize_packet2: BASE %ld TIMESTAMP %ld PTS %ld\n", s->base_timestamp, timestamp, pkt->pts);
 }
 
 static int rtp_parse_packet_internal(RTPDemuxContext *s, AVPacket *pkt,
@@ -601,6 +687,7 @@ static int rtp_parse_packet_internal(RTPDemuxContext *s, AVPacket *pkt,
     uint32_t timestamp;
     int rv = 0;
 
+	
     csrc         = buf[0] & 0x0f;
     ext          = buf[0] & 0x10;
     payload_type = buf[1] & 0x7f;
@@ -611,6 +698,9 @@ static int rtp_parse_packet_internal(RTPDemuxContext *s, AVPacket *pkt,
     ssrc      = AV_RB32(buf + 8);
     /* store the ssrc in the RTPDemuxContext */
     s->ssrc = ssrc;
+
+	//ag
+	//av_log(NULL, AV_LOG_INFO, "RTP: TIMESTAMP %d\n", timestamp);
 
     /* NOTE: we can handle only one payload type */
     if (s->payload_type != payload_type)
@@ -751,6 +841,8 @@ static int rtp_parse_one_packet(RTPDemuxContext *s, AVPacket *pkt,
     int flags = 0;
     uint32_t timestamp;
     int rv = 0;
+	
+
 
     if (!buf) {
         /* If parsing of the previous packet actually returned 0 or an error,
@@ -824,15 +916,66 @@ static int rtp_parse_one_packet(RTPDemuxContext *s, AVPacket *pkt,
  * @param pkt returned packet
  * @param bufptr pointer to the input buffer or NULL to read the next packets
  * @param len buffer len
+ * @param wasBuffered this packet was previously cached waiting for NTP timestamp
  * @return 0 if a packet is returned, 1 if a packet is returned and more can follow
  * (use buf as NULL to read the next). -1 if no packet (error or no more packet).
  */
 int ff_rtp_parse_packet(RTPDemuxContext *s, AVPacket *pkt,
-                        uint8_t **bufptr, int len)
+                        uint8_t **bufptr, int len, int wasBuffered)
 {
     int rv;
+	uint8_t *buf = bufptr ? *bufptr : NULL;
     if (s->srtp_enabled && bufptr && ff_srtp_decrypt(&s->srtp, *bufptr, &len) < 0)
         return -1;
+
+	//ag
+	if (buf && (!s->base_timestamp && s->ic->nb_streams > 1 && s->first_rtcp_ntp_time == AV_NOPTS_VALUE || s->waiting_buffers_queue != NULL) && !wasBuffered) {
+		//rtcp ntp time not yet received but multiple RTP streams are present or waiting_buffers_queue not yet consumed. 
+		//Check if this packet is a RTCP packet and parse it if true, otherwise enqueue RTP packet ...
+		RTPBuffer **last_packet_buffer_ptr, *packet_buffer;
+		int cnt = 0;
+
+		if (len < 12)
+			return -1;
+
+		if ((buf[0] & 0xc0) != (RTP_VERSION << 6))
+			return -1;
+		if (RTP_PT_IS_RTCP(buf[1])) {
+			return rtcp_parse_packet(s, buf, len);
+		}
+
+		last_packet_buffer_ptr = &s->waiting_buffers_queue;
+		
+
+		/* Find the correct place in the queue to insert the packet */
+		while (*last_packet_buffer_ptr) {
+			last_packet_buffer_ptr = &(*last_packet_buffer_ptr)->next;
+			cnt++;
+		}
+		av_log(NULL, AV_LOG_INFO, "RTP rtcp ntp time not yet received (first_rtcp_ntp_time %ld, base_timestamp %d, waiting_buffers_queue %ld) but multiple RTP streams are present. Enqueueing packet at position %d waiting for RTCP packet ...\n", 
+			s->first_rtcp_ntp_time, 
+			s->base_timestamp, 
+			s->waiting_buffers_queue,
+			cnt
+			);
+
+		packet_buffer = av_mallocz(sizeof(*packet_buffer));
+		if (!packet_buffer)
+			return AVERROR(ENOMEM);
+		packet_buffer->buf = av_malloc(len);
+		if (!packet_buffer->buf)
+			return AVERROR(ENOMEM);
+		memcpy(packet_buffer->buf, buf, len);
+		packet_buffer->len = len;
+		*last_packet_buffer_ptr = packet_buffer;
+		return -1;
+	}
+	if (!wasBuffered && s->waiting_buffers_queue != NULL) {
+		av_log(NULL, AV_LOG_ERROR, "Trying to consume a non buffered packet but there is still a waiting_buffers_queue!!! BUG!\n");
+		return AVERROR(AVERROR_BUG);
+	}
+	/////
+
     rv = rtp_parse_one_packet(s, pkt, bufptr, len);
     s->prev_ret = rv;
     while (rv == AVERROR(EAGAIN) && has_next_packet(s))

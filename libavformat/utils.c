@@ -890,7 +890,8 @@ static void update_initial_timestamps(AVFormatContext *s, int stream_index,
     int64_t pts_buffer[MAX_REORDER_DELAY+1];
     int64_t shift;
     int i, delay;
-
+	//ag
+	//av_log(s, AV_LOG_INFO, "update_initial_timestamps\n");
     if (st->first_dts != AV_NOPTS_VALUE ||
         dts           == AV_NOPTS_VALUE ||
         st->cur_dts   == AV_NOPTS_VALUE ||
@@ -1093,7 +1094,7 @@ static void compute_pkt_fields(AVFormatContext *s, AVStream *st,
         presentation_delayed = 1;
 
     if (s->debug & FF_FDEBUG_TS)
-        av_log(s, AV_LOG_TRACE,
+        av_log(s, AV_LOG_INFO,
             "IN delayed:%d pts:%s, dts:%s cur_dts:%s st:%d pc:%p duration:%d delay:%d onein_oneout:%d\n",
             presentation_delayed, av_ts2str(pkt->pts), av_ts2str(pkt->dts), av_ts2str(st->cur_dts),
             pkt->stream_index, pc, pkt->duration, delay, onein_oneout);
@@ -1353,7 +1354,7 @@ static int read_frame_internal(AVFormatContext *s, AVPacket *pkt)
                    cur_pkt.size);
         }
         if (s->debug & FF_FDEBUG_TS)
-            av_log(s, AV_LOG_DEBUG,
+            av_log(s, AV_LOG_INFO,
                    "ff_read_packet stream=%d, pts=%s, dts=%s, size=%d, duration=%d, flags=%d\n",
                    cur_pkt.stream_index,
                    av_ts2str(cur_pkt.pts),
